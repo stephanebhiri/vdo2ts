@@ -184,6 +184,11 @@ class VDOBridge:
         pad.link(depay.get_static_pad('sink'))
         print(f'[OK] H264 → {self.output}', flush=True)
 
+        # Request a keyframe so downstream receivers can sync quickly
+        s = Gst.Structure.new_empty('GstForceKeyUnit')
+        s.set_value('all-headers', True)
+        pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, s))
+
     def _on_ice_candidate(self, _, mline, candidate):
         if ' TCP ' in candidate:
             return
@@ -215,10 +220,12 @@ class VDOBridge:
         state = webrtcbin.get_property('connection-state')
         names = {0: 'new', 1: 'connecting', 2: 'connected', 3: 'disconnected', 4: 'failed', 5: 'closed'}
         print(f'[WebRTC] {names.get(state, state)}', flush=True)
-        # Signal disconnection to the WS loop so it can retry
-        if state >= 3 and self.ws_conn and self.aio_loop:  # disconnected/failed/closed
-            self._shutdown = True
-            asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+        # Close WS to break the async for loop → triggers reconnection
+        if state >= 3 and self.ws_conn and self.aio_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+            except RuntimeError:
+                pass  # Event loop already closed
 
     # -- Data channel (VDO.Ninja 2-stage negotiation) -----------------------
 
@@ -349,7 +356,10 @@ class VDOBridge:
     def close(self):
         self._shutdown = True
         if self.ws_conn and self.aio_loop:
-            asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+            try:
+                asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+            except RuntimeError:
+                pass  # Event loop already closed
         self._teardown()
 
     # -- Main loop ----------------------------------------------------------
