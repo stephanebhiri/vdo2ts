@@ -121,6 +121,9 @@ class VDOBridge:
         self.webrtc = None
         self.glib_loop = GLib.MainLoop()
         self.got_video = False
+        self.got_audio = False
+        self.mux = None
+        self.sink = None
         self.remote_desc_set = False
         self.ice_buffer = []
         self._shutdown = False
@@ -159,35 +162,80 @@ class VDOBridge:
 
     # -- WebRTC callbacks ---------------------------------------------------
 
+    def _ensure_mux(self):
+        """Create the shared mpegtsmux + sink if not already created."""
+        if self.mux:
+            return
+        self.mux, self.sink = self._make_output()
+        self.pipe.add(self.mux)
+        self.pipe.add(self.sink)
+        self.mux.link(self.sink)
+        self.mux.sync_state_with_parent()
+        self.sink.sync_state_with_parent()
+
     def _on_pad_added(self, _, pad):
         if pad.get_direction() != Gst.PadDirection.SRC:
             return
         caps = pad.get_current_caps()
         if not caps:
             return
-        enc = caps.get_structure(0).get_string('encoding-name') or ''
-        if enc == 'RTX' or enc != 'H264' or self.got_video:
+        s = caps.get_structure(0)
+        enc = s.get_string('encoding-name') or ''
+        media = s.get_string('media') or ''
+
+        if enc == 'RTX':
             return
-        self.got_video = True
 
-        depay = Gst.ElementFactory.make('rtph264depay', 'depay')
-        parse = Gst.ElementFactory.make('h264parse', 'parse')
-        parse.set_property('config-interval', -1)
-        mux, sink = self._make_output()
+        # H264 video
+        if enc == 'H264' and not self.got_video:
+            self.got_video = True
+            self._ensure_mux()
 
-        for el in (depay, parse, mux, sink):
-            self.pipe.add(el)
-            el.sync_state_with_parent()
-        depay.link(parse)
-        parse.link(mux)
-        mux.link(sink)
-        pad.link(depay.get_static_pad('sink'))
-        print(f'[OK] H264 → {self.output}', flush=True)
+            depay = Gst.ElementFactory.make('rtph264depay', 'depay')
+            parse = Gst.ElementFactory.make('h264parse', 'parse')
+            parse.set_property('config-interval', -1)
 
-        # Request a keyframe so downstream receivers can sync quickly
-        s = Gst.Structure.new_empty('GstForceKeyUnit')
-        s.set_value('all-headers', True)
-        pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, s))
+            for el in (depay, parse):
+                self.pipe.add(el)
+                el.sync_state_with_parent()
+            depay.link(parse)
+            parse.link(self.mux)
+            pad.link(depay.get_static_pad('sink'))
+            print(f'[OK] H264 video → {self.output}', flush=True)
+
+            # Request a keyframe so downstream receivers can sync quickly
+            ev = Gst.Structure.new_empty('GstForceKeyUnit')
+            ev.set_value('all-headers', True)
+            pad.send_event(Gst.Event.new_custom(Gst.EventType.CUSTOM_UPSTREAM, ev))
+
+        # Opus audio
+        elif enc == 'OPUS' and not self.got_audio:
+            self.got_audio = True
+            self._ensure_mux()
+
+            depay = Gst.ElementFactory.make('rtpopusdepay', 'adepay')
+            dec = Gst.ElementFactory.make('opusdec', 'adec')
+            conv = Gst.ElementFactory.make('audioconvert', 'aconv')
+            # MPEG-TS needs AAC or MP2 — encode to AAC
+            aenc = Gst.ElementFactory.make('avenc_aac', 'aenc')
+            if not aenc:
+                # Fallback to fdkaacenc or voaacenc
+                aenc = Gst.ElementFactory.make('fdkaacenc', 'aenc')
+            if not aenc:
+                aenc = Gst.ElementFactory.make('voaacenc', 'aenc')
+            if not aenc:
+                print('[WARN] No AAC encoder found, skipping audio', flush=True)
+                return
+
+            for el in (depay, dec, conv, aenc):
+                self.pipe.add(el)
+                el.sync_state_with_parent()
+            depay.link(dec)
+            dec.link(conv)
+            conv.link(aenc)
+            aenc.link(self.mux)
+            pad.link(depay.get_static_pad('sink'))
+            print(f'[OK] Opus audio → AAC → {self.output}', flush=True)
 
     def _on_ice_candidate(self, _, mline, candidate):
         if ' TCP ' in candidate:
@@ -235,7 +283,7 @@ class VDOBridge:
 
     def _on_dc_open(self, channel):
         self.dc_channel = channel
-        channel.emit('send-string', json.dumps({"audio": False, "video": True}))
+        channel.emit('send-string', json.dumps({"audio": True, "video": True}))
         print('[DC] Requesting video...', flush=True)
 
     def _on_dc_message(self, channel, msg_str):
