@@ -1,60 +1,78 @@
 # vdo2ts
 
-Receive a [VDO.Ninja](https://vdo.ninja) stream and output it as MPEG-TS (file or UDP).
+Receive a [VDO.Ninja](https://vdo.ninja) stream and output it as MPEG-TS — no browser, no OBS.
 
-Handles the full VDO.Ninja signaling protocol: WebSocket handshake, AES-256-CBC encryption, 2-stage data channel negotiation, and H264 passthrough via GStreamer's webrtcbin.
+A single Python script that connects to VDO.Ninja's signaling server, negotiates WebRTC, and pipes the H264 video straight into an MPEG-TS file or UDP stream. Zero transcoding — the video passes through untouched.
 
-## Install
+## Why
 
-System dependencies (GStreamer with WebRTC support):
+VDO.Ninja is great for getting a camera feed from a phone or browser into a production. But the usual workflow requires OBS or a browser on the receiving end. Sometimes you just need a raw transport stream — to feed into an encoder, a routing system, or a multicast network. That's what this does.
+
+## Requirements
+
+**GStreamer** (1.20+) with WebRTC support:
 
 ```bash
 # macOS
 brew install gstreamer gst-plugins-base gst-plugins-bad gst-plugins-good gst-python
 
 # Debian/Ubuntu
-apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-plugins-good \
-            gstreamer1.0-nice python3-gst-1.0
+apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-good gstreamer1.0-nice python3-gst-1.0
 ```
 
-Python dependencies:
+**Python packages:**
 
 ```bash
-pip install -r requirements.txt
+pip install websockets cryptography PyGObject
 ```
 
 ## Usage
 
 ```bash
-# Save to file
-python3 vdo2ts.py <stream_id>
+# Record to file
+python3 vdo2ts.py myStreamId
 
-# Output to UDP (use with ffplay, VLC, or any MPEG-TS receiver)
-python3 vdo2ts.py <stream_id> udp://127.0.0.1:5000
+# Output to UDP — play with ffplay, VLC, or any MPEG-TS receiver
+python3 vdo2ts.py myStreamId udp://127.0.0.1:5000
 
 # Play it
 ffplay udp://127.0.0.1:5000
 
-# Custom password
-python3 vdo2ts.py <stream_id> udp://127.0.0.1:5000 --password mySecret
+# Multicast
+python3 vdo2ts.py myStreamId udp://239.0.0.1:5000
+
+# Custom password (if the publisher set &password= in their URL)
+python3 vdo2ts.py myStreamId udp://127.0.0.1:5000 --password mySecret
+
+# One-shot mode (exit on disconnect instead of retrying)
+python3 vdo2ts.py myStreamId --no-retry
 ```
 
 The `stream_id` is the part after `?view=` in the VDO.Ninja URL.
-For example, if the URL is `https://vdo.ninja/?view=abc123`, the stream ID is `abc123`.
+`https://vdo.ninja/?view=abc123` → stream ID is `abc123`.
 
-## How it works
+## What it does
 
-1. Connects to VDO.Ninja's WSS signaling server
-2. Sends an encrypted `play` request for the stream
-3. Receives a datachannel-only SDP offer, negotiates WebRTC connection
-4. Once the data channel opens, requests video
-5. Publisher renegotiates with a video SDP via the data channel
-6. H264 RTP is depayloaded and muxed into MPEG-TS
+1. Connects to VDO.Ninja's WebSocket signaling server
+2. Exchanges encrypted SDP offers/answers (AES-256-CBC)
+3. Establishes a WebRTC peer connection via GStreamer's webrtcbin
+4. Opens a data channel and requests video from the publisher
+5. Receives H264 RTP, depayloads it, and muxes into MPEG-TS
+6. If the publisher disconnects, waits and reconnects automatically
 
-The video is **not transcoded** — it's a zero-copy passthrough from WebRTC RTP to MPEG-TS.
+No transcoding. The H264 from the browser/phone goes straight into the transport stream.
 
-## Notes
+## Good to know
 
-- When joining a UDP stream mid-session, expect a few seconds of `PPS 0 referenced` errors in ffplay/ffmpeg — this is normal, it's waiting for the next keyframe.
-- For best results with `ffplay`, use: `ffplay -analyzeduration 10000000 -probesize 10000000 udp://127.0.0.1:5000`
-- VDO.Ninja's default encryption password is `someEncryptionKey123`. If the publisher uses a custom `&password=` parameter, pass the same value with `--password`.
+- **Slow start with ffplay/VLC:** When joining a UDP stream, the player has to wait for the next keyframe before it can decode. This can take a few seconds. If it doesn't start, quit and relaunch — you probably just missed the keyframe window. Using `ffplay -analyzeduration 10000000 -probesize 10000000` helps.
+
+- **Auto-reconnect:** If the publisher drops, the bridge retries automatically with backoff (5s → 15s → 30s → 60s). Disable with `--no-retry`.
+
+- **Encryption:** VDO.Ninja encrypts signaling by default with the password `someEncryptionKey123`. If the publisher uses a custom `&password=`, pass the same value with `--password`.
+
+- **VDO.Ninja protocol:** This tool implements VDO.Ninja's signaling from scratch (WebSocket handshake, AES encryption, stream ID hashing, 2-stage data channel negotiation). This protocol is not a public API and may change. Built by studying [raspberry_ninja](https://github.com/steveseguin/raspberry_ninja).
+
+## License
+
+MIT
