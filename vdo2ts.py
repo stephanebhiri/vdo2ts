@@ -22,6 +22,11 @@ Examples:
     python3 vdo2ts.py fshSvdAvq udp://127.0.0.1:5000       # Output to UDP
     python3 vdo2ts.py fshSvdAvq udp://239.0.0.99:5000      # Output to multicast
 
+Note:
+    The signaling protocol used by VDO.Ninja (handshake server, message
+    format, 2-stage negotiation via data channel) is not a stable public
+    API. It may change without notice. See https://docs.vdo.ninja/.
+
 Requires:
     - GStreamer 1.20+ with gst-plugins-bad (webrtcbin)
     - Python: websockets, cryptography, PyGObject
@@ -185,6 +190,20 @@ class VDOBridge:
             msg['session'] = self.session_id
         self._send_ws(msg)
 
+    def _on_ice_gathering_state(self, webrtcbin, pspec):
+        state = webrtcbin.get_property('ice-gathering-state')
+        if state == GstWebRTC.WebRTCICEGatheringState.COMPLETE:
+            msg = {
+                'candidates': [{'candidate': '', 'sdpMLineIndex': 0}],
+                'type': 'remote',
+            }
+            if self.peer_uuid:
+                msg['UUID'] = self.peer_uuid
+            if self.session_id:
+                msg['session'] = self.session_id
+            self._send_ws(msg)
+            print('[ICE] Gathering complete', flush=True)
+
     def _on_connection_state(self, webrtcbin, pspec):
         state = webrtcbin.get_property('connection-state')
         names = {0: 'new', 1: 'connecting', 2: 'connected', 3: 'disconnected', 4: 'failed', 5: 'closed'}
@@ -230,8 +249,9 @@ class VDOBridge:
                 self.remote_desc_set = False
                 GLib.idle_add(lambda s=sdp: self._process_offer(s, reoffer=True) or False)
 
-        elif 'candidates' in msg:
-            cands = msg['candidates']
+        elif 'candidates' in msg or 'candidate' in msg:
+            key = 'candidates' if 'candidates' in msg else 'candidate'
+            cands = msg[key]
             if not isinstance(cands, list):
                 cands = [cands]
             GLib.idle_add(lambda c=cands: self._add_ice(c) or False)
@@ -303,6 +323,16 @@ class VDOBridge:
             self._add_ice(self.ice_buffer[:])
             self.ice_buffer.clear()
 
+    # -- Cleanup ------------------------------------------------------------
+
+    def close(self):
+        if self.ws_conn and self.aio_loop:
+            asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+        if self.pipe:
+            self.pipe.set_state(Gst.State.NULL)
+        if self.glib_loop.is_running():
+            self.glib_loop.quit()
+
     # -- Main loop ----------------------------------------------------------
 
     async def run(self):
@@ -315,6 +345,7 @@ class VDOBridge:
 
         self.webrtc.connect('pad-added', self._on_pad_added)
         self.webrtc.connect('on-ice-candidate', self._on_ice_candidate)
+        self.webrtc.connect('notify::ice-gathering-state', self._on_ice_gathering_state)
         self.webrtc.connect('on-data-channel', self._on_data_channel)
         self.webrtc.connect('notify::connection-state', self._on_connection_state)
         self.pipe.set_state(Gst.State.PLAYING)
@@ -373,9 +404,10 @@ class VDOBridge:
                     print(f'[WS] Offer received', flush=True)
                     GLib.idle_add(lambda s=desc['sdp']: self._process_offer(s) or False)
 
-            # ICE candidates
-            elif 'candidates' in msg:
-                cands = msg['candidates']
+            # ICE candidates (plural or singular)
+            elif 'candidates' in msg or 'candidate' in msg:
+                key = 'candidates' if 'candidates' in msg else 'candidate'
+                cands = msg[key]
                 if 'vector' in msg:
                     try:
                         cands = json.loads(decrypt_msg(cands, msg['vector'], self.passkey))
@@ -420,8 +452,7 @@ def main():
     except KeyboardInterrupt:
         print('\nStopped.')
     finally:
-        if bridge.pipe:
-            bridge.pipe.set_state(Gst.State.NULL)
+        bridge.close()
 
 
 if __name__ == '__main__':
