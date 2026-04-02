@@ -86,11 +86,15 @@ def decrypt_msg(ct_hex, iv_hex, passphrase):
 # ---------------------------------------------------------------------------
 
 class VDOBridge:
-    def __init__(self, stream_id, output, password, wss_url):
+    # Reconnection backoff schedule (seconds)
+    RETRY_DELAYS = [5, 15, 30, 60, 60, 60]  # then stays at 60s
+
+    def __init__(self, stream_id, output, password, wss_url, auto_retry=True):
         self.stream_id = stream_id
         self.output = output
         self.password = password
         self.wss_url = wss_url
+        self.auto_retry = auto_retry
 
         # VDO.Ninja derives the salt from the WSS hostname
         from urllib.parse import urlparse
@@ -103,20 +107,23 @@ class VDOBridge:
         self.full_stream_id = self.stream_id + self.hashcode
         self.our_id = str(random.randint(10_000_000, 99_999_999_999))
 
-        # Peer state
+        self._reset_state()
+
+    def _reset_state(self):
+        """Reset all mutable state for a fresh connection attempt."""
         self.peer_uuid = None
         self.session_id = None
         self.ws_conn = None
         self.aio_loop = None
         self.dc_channel = None
 
-        # GStreamer state
         self.pipe = None
         self.webrtc = None
         self.glib_loop = GLib.MainLoop()
         self.got_video = False
         self.remote_desc_set = False
         self.ice_buffer = []
+        self._shutdown = False
 
     # -- WebSocket helpers --------------------------------------------------
 
@@ -208,6 +215,10 @@ class VDOBridge:
         state = webrtcbin.get_property('connection-state')
         names = {0: 'new', 1: 'connecting', 2: 'connected', 3: 'disconnected', 4: 'failed', 5: 'closed'}
         print(f'[WebRTC] {names.get(state, state)}', flush=True)
+        # Signal disconnection to the WS loop so it can retry
+        if state >= 3 and self.ws_conn and self.aio_loop:  # disconnected/failed/closed
+            self._shutdown = True
+            asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
 
     # -- Data channel (VDO.Ninja 2-stage negotiation) -----------------------
 
@@ -325,17 +336,29 @@ class VDOBridge:
 
     # -- Cleanup ------------------------------------------------------------
 
-    def close(self):
-        if self.ws_conn and self.aio_loop:
-            asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+    def _teardown(self):
+        """Tear down GStreamer pipeline and GLib loop."""
         if self.pipe:
             self.pipe.set_state(Gst.State.NULL)
+            self.pipe = None
         if self.glib_loop.is_running():
             self.glib_loop.quit()
+        self.webrtc = None
+        self.dc_channel = None
+
+    def close(self):
+        self._shutdown = True
+        if self.ws_conn and self.aio_loop:
+            asyncio.run_coroutine_threadsafe(self.ws_conn.close(), self.aio_loop)
+        self._teardown()
 
     # -- Main loop ----------------------------------------------------------
 
-    async def run(self):
+    async def _connect_once(self):
+        """Single connection attempt. Returns when disconnected."""
+        self._reset_state()
+        self.aio_loop = asyncio.get_event_loop()
+
         # GStreamer pipeline
         self.pipe = Gst.Pipeline.new('vdo2ts')
         self.webrtc = Gst.ElementFactory.make('webrtcbin', 'webrtc')
@@ -359,7 +382,6 @@ class VDOBridge:
 
         print(f'[WS] Connecting...', flush=True)
         self.ws_conn = await websockets.connect(self.wss_url, ssl=ssl_ctx, ping_interval=None)
-        self.aio_loop = asyncio.get_event_loop()
 
         await self.ws_conn.send(json.dumps({
             'request': 'play',
@@ -422,6 +444,36 @@ class VDOBridge:
                     cands = [cands]
                 GLib.idle_add(lambda c=cands: self._add_ice(c) or False)
 
+        # WS closed — clean up pipeline
+        self._teardown()
+
+    async def run(self):
+        """Main loop with auto-reconnection."""
+        attempt = 0
+        while True:
+            try:
+                await self._connect_once()
+            except (websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.InvalidStatusCode,
+                    ConnectionRefusedError, OSError) as e:
+                print(f'[WS] Disconnected: {e}', flush=True)
+                self._teardown()
+            except Exception as e:
+                print(f'[Error] {e}', flush=True)
+                self._teardown()
+
+            if not self.auto_retry or self._shutdown:
+                break
+
+            delay = self.RETRY_DELAYS[min(attempt, len(self.RETRY_DELAYS) - 1)]
+            attempt += 1
+            print(f'[Retry] Reconnecting in {delay}s (attempt {attempt})...', flush=True)
+            await asyncio.sleep(delay)
+
+            # Reset backoff on successful connection
+            if self.got_video:
+                attempt = 0
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -443,9 +495,12 @@ def main():
                         help='Encryption password (default: VDO.Ninja default)')
     parser.add_argument('--server', default='wss://wss.vdo.ninja:443',
                         help='WSS signaling server')
+    parser.add_argument('--no-retry', action='store_true',
+                        help='Exit on disconnect instead of auto-reconnecting')
     args = parser.parse_args()
 
-    bridge = VDOBridge(args.stream_id, args.output, args.password, args.server)
+    bridge = VDOBridge(args.stream_id, args.output, args.password, args.server,
+                       auto_retry=not args.no_retry)
     print(f'vdo2ts — {bridge.stream_id} → {bridge.output}')
     try:
         asyncio.run(bridge.run())
