@@ -61,7 +61,12 @@ The `stream_id` is the part after `?view=` in the VDO.Ninja URL.
 5. Receives H264 RTP, depayloads it, and muxes into MPEG-TS
 6. If the publisher disconnects, waits and reconnects automatically
 
-No transcoding. The H264 from the browser/phone goes straight into the transport stream.
+The video (H264) passes through without transcoding. Audio (Opus from WebRTC) is decoded and re-encoded to AAC for MPEG-TS compatibility.
+
+## Limitations
+
+- **H264 only.** VP8, VP9 and AV1 streams are ignored. In practice, browsers and phones on VDO.Ninja send H264.
+- **Audio is transcoded** (Opus → AAC). There's no way around it — MPEG-TS doesn't carry Opus natively.
 
 ## Good to know
 
